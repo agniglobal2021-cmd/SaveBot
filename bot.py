@@ -120,7 +120,7 @@ def allowed(update: Update) -> bool:
 
 
 def find_url(msg: Message) -> str | None:
-    for ent in (msg.entities or []) + (msg.caption_entities or []):
+    for ent in (*(msg.entities or ()), *(msg.caption_entities or ())):
         if ent.type == "text_link" and ent.url:
             return ent.url
     m = URL_RE.search(msg.text or msg.caption or "")
@@ -537,7 +537,13 @@ async def run_spotify_collection(context, menu: Message, sess: dict):
 # ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Любой сбой — в лог и ответом в чат, чтобы бот не молчал."""
     logger.error("Необработанная ошибка", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message and allowed(update):
+        try:
+            await update.effective_message.reply_text(f"Что-то сломалось: {h(context.error)}"[:1000])
+        except TelegramError:
+            pass
 
 
 async def post_init(app: Application):

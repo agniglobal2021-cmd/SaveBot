@@ -191,3 +191,19 @@ def test_spotify_html_fallback():
     t = spotify.parse_embed(page, "track", "q" * 22).tracks[0]
     assert t.title == "Never Gonna Give You Up" and t.artists == ["Rick Astley"]
     assert t.cover.startswith("https://image-cdn-fa.spotifycdn.com/image/")
+
+
+def test_find_url_real_message():
+    """Telegram отдаёт entities кортежем — раньше на этом падало."""
+    from datetime import datetime
+    from telegram import Chat, Message, MessageEntity
+    import bot
+    chat = Chat(1, "private")
+    m = Message(1, datetime.now(), chat, text="глянь https://youtu.be/abc).",
+                entities=(MessageEntity("url", 6, 21),))
+    assert bot.find_url(m) == "https://youtu.be/abc"
+    m = Message(2, datetime.now(), chat, text="тут", entities=(MessageEntity("text_link", 0, 3, url="https://x.com/a"),))
+    assert bot.find_url(m) == "https://x.com/a"
+    m = Message(3, datetime.now(), chat, caption="https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
+    assert "spotify" in bot.find_url(m)
+    assert bot.find_url(Message(4, datetime.now(), chat, text="привет")) is None
