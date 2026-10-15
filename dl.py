@@ -70,6 +70,81 @@ def _base_opts() -> dict:
     return opts
 
 
+# ═══════════════════════════════════════════════════════════════
+# ОБХОДЫ БЛОКИРОВКИ YOUTUBE
+# ═══════════════════════════════════════════════════════════════
+# YouTube не любит адреса дата-центров («Sign in to confirm you're not a bot»).
+# Без кук пробуем по очереди: другие клиенты YouTube (телевизор, мобильный сайт, VR-приложение)
+# и выход в интернет через Cloudflare WARP (start.sh поднимает его как SOCKS-прокси).
+# Сработавший способ запоминаем и дальше начинаем с него.
+WARP_PROXY = os.getenv("WARP_PROXY", "socks5://127.0.0.1:40000")
+
+STRATEGIES = [
+    ("прямо", {}),
+    ("прямо, клиент ТВ", {"extractor_args": {"youtube": {"player_client": ["tv_simply", "tv"]}}}),
+    ("прямо, мобильный", {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}}),
+    ("WARP", {"proxy": "warp"}),
+    ("WARP, клиент ТВ", {"proxy": "warp", "extractor_args": {"youtube": {"player_client": ["tv_simply", "tv"]}}}),
+    ("WARP, мобильный", {"proxy": "warp", "extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}}),
+]
+_working = 0
+
+
+def warp_up() -> bool:
+    import socket
+    from urllib.parse import urlparse
+    u = urlparse(WARP_PROXY)
+    try:
+        with socket.create_connection((u.hostname, u.port or 1080), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def is_blocked(err: Exception) -> bool:
+    low = str(err).lower()
+    return any(k in low for k in ("sign in to confirm", "not a bot", "http error 403", "http error 429",
+                                  "this content isn't available", "requested format is not available",
+                                  "failed to extract any player response", "unable to download api page"))
+
+
+def extract(url: str, opts: dict, download: bool) -> dict:
+    """extract_info с перебором обходов. Не про блокировку — ошибка сразу наверх."""
+    global _working
+    order = [_working] + [i for i in range(len(STRATEGIES)) if i != _working]
+    warp = None
+    last = None
+    for i in order:
+        name, extra = STRATEGIES[i]
+        o = dict(opts)
+        if extra.get("proxy") == "warp":
+            if warp is None:
+                warp = warp_up()
+            if not warp:
+                continue
+            o["proxy"] = WARP_PROXY
+        if "extractor_args" in extra:
+            o["extractor_args"] = extra["extractor_args"]
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=download)
+                info = ydl.sanitize_info(info) if info else info
+            if i != _working:
+                logger.info("YouTube пустил способом «%s»", name)
+                _working = i
+            return info
+        except yt_dlp.utils.DownloadError as e:
+            last = e
+            if not is_blocked(e):
+                raise DownloadError(explain(e)) from e
+            logger.warning("Способ «%s» не прошёл: %s", name, str(e).splitlines()[0][:200])
+    msg = explain(last) if last else "Не получилось."
+    if last and ("sign in" in str(last).lower() or "not a bot" in str(last).lower()):
+        msg = ("YouTube не пускает сервер ни одним из обходов"
+               + ("" if warp else " (WARP не поднялся)") + ". Поможет только YT_COOKIES — см. README.")
+    raise DownloadError(msg)
+
+
 def explain(err: Exception) -> str:
     """Перевод частых ошибок yt-dlp на человеческий."""
     text = str(err)
@@ -99,14 +174,10 @@ def explain(err: Exception) -> str:
 def probe(url: str) -> dict:
     """Всё о ссылке без скачивания. Для плейлиста — список роликов без подробностей."""
     opts = _base_opts() | {"skip_download": True, "extract_flat": "in_playlist"}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise DownloadError(explain(e)) from e
+    info = extract(url, opts, download=False)
     if not info:
         raise DownloadError("По ссылке ничего не нашлось.")
-    return ydl.sanitize_info(info)
+    return info
 
 
 def is_playlist(info: dict) -> bool:
@@ -270,12 +341,9 @@ def download(url: str, opt: str, workdir: str, progress=None, vertical: bool = F
         opts["progress_hooks"] = [_progress_hook(progress)]
         opts["postprocessor_hooks"] = [_pp_hook(progress)]
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            info = ydl.sanitize_info(info)
-    except yt_dlp.utils.DownloadError as e:
-        raise DownloadError(explain(e)) from e
+    info = extract(url, opts, download=True)
+    if not info:
+        raise DownloadError("По ссылке ничего не нашлось.")
 
     path = _final_path(info, workdir, opt)
     if not path:

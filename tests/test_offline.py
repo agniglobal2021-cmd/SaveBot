@@ -223,3 +223,84 @@ def test_spotify_album_html_fallback():
     assert t3.title == "I Didn't Just" and t3.duration == 3723
     assert t1.id != c.tracks[1].id and len(t1.id) == 22
     assert t1.cover.startswith("https://image-cdn-fa")
+
+
+# ─────────────────────── обходы блокировки ───────────────────────
+class FakeYDL:
+    calls = []
+    rule = staticmethod(lambda o: True)
+
+    def __init__(self, opts):
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def extract_info(self, url, download):
+        import yt_dlp
+        FakeYDL.calls.append((self.opts.get("proxy"), (self.opts.get("extractor_args") or {}).get("youtube")))
+        if not FakeYDL.rule(self.opts):
+            raise yt_dlp.utils.DownloadError("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+        return {"id": "x", "title": "ok"}
+
+    def sanitize_info(self, i):
+        return i
+
+
+def test_strategies_fall_through_to_warp(monkeypatch):
+    import yt_dlp
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(dl, "warp_up", lambda: True)
+    monkeypatch.setattr(dl, "_working", 0)
+    FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: bool(o.get("proxy")))
+    assert dl.extract("u", {}, False)["title"] == "ok"
+    assert len(FakeYDL.calls) == 4 and FakeYDL.calls[-1][0] == dl.WARP_PROXY
+    # второй раз сразу начинаем с WARP
+    FakeYDL.calls = []
+    dl.extract("u", {}, False)
+    assert len(FakeYDL.calls) == 1
+
+
+def test_strategies_no_warp_and_blocked(monkeypatch):
+    import yt_dlp
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(dl, "warp_up", lambda: False)
+    monkeypatch.setattr(dl, "_working", 0)
+    FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: False)
+    try:
+        dl.extract("u", {}, False)
+        assert False
+    except dl.DownloadError as e:
+        assert "WARP не поднялся" in str(e) and "YT_COOKIES" in str(e)
+    assert len(FakeYDL.calls) == 3           # без WARP — только прямые способы
+
+
+def test_other_errors_not_retried(monkeypatch):
+    import yt_dlp
+
+    class Boom(FakeYDL):
+        def extract_info(self, url, download):
+            FakeYDL.calls.append(1)
+            raise yt_dlp.utils.DownloadError("ERROR: Private video")
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", Boom)
+    monkeypatch.setattr(dl, "_working", 0)
+    FakeYDL.calls = []
+    try:
+        dl.extract("u", {}, False)
+    except dl.DownloadError as e:
+        assert str(e) == "Видео приватное."
+    assert FakeYDL.calls == [1]
+
+
+def test_sc_match():
+    t = spotify.Track(id="1", title="Fahr zur Hölle", artists=["Bohren & Der Club Of Gore"], duration=600)
+    good = {"title": "Fahr zur Hölle", "uploader": "Bohren & Der Club Of Gore", "duration": 601}
+    fan = {"title": "Bohren - Fahr Zur Hölle", "uploader": "jazzfan", "duration": 598}
+    preview = {"title": "Fahr zur Hölle", "uploader": "x", "duration": 30}
+    other = {"title": "Im Rauch", "uploader": "Bohren & Der Club Of Gore", "duration": 600}
+    remix = {"title": "Fahr zur Hölle (Remix)", "uploader": "dj", "duration": 605}
+    assert spotify.sc_match(preview, t) is None and spotify.sc_match(other, t) is None
+    assert spotify.sc_match(good, t) < spotify.sc_match(fan, t) < spotify.sc_match(remix, t)

@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 
 import httpx
-import yt_dlp
-
 import dl
 
 logger = logging.getLogger("savebot.spotify")
@@ -270,10 +268,9 @@ def find_on_youtube(track: Track) -> str:
                 f"ytsearch6:{track.query} audio"):
         try:
             opts = dl._base_opts() | {"extract_flat": True, "skip_download": True, "playlistend": 6}
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                res = ydl.extract_info(url, download=False) or {}
+            res = dl.extract(url, opts, download=False) or {}
             candidates = [e for e in (res.get("entries") or []) if e and e.get("id")]
-        except yt_dlp.utils.DownloadError as e:
+        except dl.DownloadError as e:
             logger.warning("Поиск %s не удался: %s", url, e)
             candidates = []
         best = pick_candidate(candidates, track)
@@ -316,9 +313,18 @@ def pick_candidate(entries: list[dict], track: Track) -> str | None:
 # СКАЧИВАНИЕ И ТЕГИ
 # ═══════════════════════════════════════════════════════════════
 def download_track(track: Track, workdir: str, progress=None) -> dl.Result:
-    yt_url = find_on_youtube(track)
-    logger.info("Spotify %s → %s", track.id, yt_url)
-    res = dl.download(yt_url, "mp3", workdir, progress=progress)
+    try:
+        yt_url = find_on_youtube(track)
+        logger.info("Spotify %s → %s", track.id, yt_url)
+        res = dl.download(yt_url, "mp3", workdir, progress=progress)
+    except dl.DownloadError as yt_err:
+        # YouTube не пустил или не нашёл — ищем тот же трек на SoundCloud
+        logger.info("Spotify %s: YouTube не вышел (%s), пробую SoundCloud", track.id, yt_err)
+        if progress:
+            progress("YouTube не пустил, ищу на SoundCloud…")
+        res = from_soundcloud(track, workdir, progress)
+        if not res:
+            raise dl.DownloadError(f"{yt_err} На SoundCloud этого трека тоже нет.") from yt_err
 
     cover_path = None
     if track.cover:
@@ -344,6 +350,63 @@ def download_track(track: Track, workdir: str, progress=None) -> dl.Result:
         os.replace(res.path, nice)
         res.path = nice
     return res
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЗАПАСНОЙ ИСТОЧНИК: SOUNDCLOUD
+# ═══════════════════════════════════════════════════════════════
+def _words(s: str) -> set[str]:
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s.lower())          # «(Remastered 2011)» не мешает
+    return {w for w in re.findall(r"\w+", s) if len(w) > 1}
+
+
+def sc_match(entry: dict, track: Track) -> float | None:
+    """Насколько найденное на SoundCloud похоже на трек. None — точно не он."""
+    want = _words(track.title)
+    got = _words(f"{entry.get('title') or ''}")
+    if want and len(want & got) / len(want) < 0.6:
+        return None
+    dur = entry.get("duration")
+    if track.duration and dur:
+        if dur < 35 and track.duration > 45:
+            return None                                    # 30-секундное превью платного трека
+        if abs(dur - track.duration) > max(15, track.duration * 0.05):
+            return None
+    score = 0.0
+    who = f"{entry.get('uploader') or ''} {entry.get('title') or ''}".lower()
+    if any(a.lower() in who for a in track.artists):
+        score -= 10
+    bad = [w for w in ("remix", "cover", "live", "edit", "sped", "slowed", "nightcore") if w not in track.title.lower()]
+    score += sum(5 for w in bad if w in (entry.get("title") or "").lower())
+    if track.duration and dur:
+        score += abs(dur - track.duration) / 3
+    return score
+
+
+def from_soundcloud(track: Track, workdir: str, progress=None) -> dl.Result | None:
+    opts = dl._base_opts() | {"skip_download": True, "playlistend": 6, "ignoreerrors": True}
+    try:
+        res = dl.extract(f"scsearch6:{track.artist} {track.title}", opts, download=False) or {}
+    except dl.DownloadError as e:
+        logger.warning("SoundCloud-поиск не вышел: %s", e)
+        return None
+    scored = [(s, e) for e in (res.get("entries") or []) if e
+              for s in [sc_match(e, track)] if s is not None]
+    for _, e in sorted(scored, key=lambda x: x[0])[:2]:
+        url = e.get("webpage_url") or e.get("url")
+        try:
+            r = dl.download(url, "mp3", workdir, progress=progress)
+        except dl.DownloadError as err:
+            logger.warning("SoundCloud %s: %s", url, err)
+            continue
+        real = dl.probe_media(r.path)[2]
+        if track.duration and real and abs(real - track.duration) > max(15, track.duration * 0.05):
+            logger.info("SoundCloud %s: длина %s вместо %s — мимо", url, real, track.duration)
+            os.remove(r.path)
+            continue
+        logger.info("Spotify %s → SoundCloud %s", track.id, url)
+        return r
+    return None
 
 
 def write_tags(path: str, track: Track, cover_path: str | None) -> None:
