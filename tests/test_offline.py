@@ -250,33 +250,44 @@ class FakeYDL:
         return i
 
 
-def test_strategies_fall_through_to_warp(monkeypatch):
+def test_strategies_fall_through_to_proxy(monkeypatch):
     import yt_dlp
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
-    monkeypatch.setattr(dl, "warp_up", lambda: True)
-    monkeypatch.setattr(dl, "_working", 0)
-    FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: bool(o.get("proxy")))
-    assert dl.extract("u", {}, False)["title"] == "ok"
-    assert len(FakeYDL.calls) == 4 and FakeYDL.calls[-1][0] == dl.WARP_PROXY
-    # второй раз сразу начинаем с WARP
+    monkeypatch.setattr(dl, "routes", lambda progress=None: [("напрямую", None), ("Tor #1", "socks5h://a:x@t"),
+                                                             ("Tor #2", "socks5h://b:x@t")])
+    monkeypatch.setattr(dl, "_working", (None, 0))
+    monkeypatch.setattr(dl, "_blocked_until", 0.0)
+    # пускает только вторая цепочка Tor
+    FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: o.get("proxy") == "socks5h://b:x@t")
+    msgs = []
+    assert dl.extract("u", {}, False, progress=msgs.append)["title"] == "ok"
+    # 3 прямых клиента, Tor #1 ×2 клиента, Tor #2 с первого раза
+    assert len(FakeYDL.calls) == 6 and FakeYDL.calls[-1] == ("socks5h://b:x@t", None)
+    assert any("Tor #2" in m for m in msgs)
+    # второй раз сразу та же цепочка
     FakeYDL.calls = []
     dl.extract("u", {}, False)
-    assert len(FakeYDL.calls) == 1
+    assert FakeYDL.calls == [("socks5h://b:x@t", None)]
 
 
-def test_strategies_no_warp_and_blocked(monkeypatch):
+def test_strategies_all_blocked(monkeypatch):
     import yt_dlp
-    monkeypatch.setattr(dl, "_blocked_until", 0.0)
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
-    monkeypatch.setattr(dl, "warp_up", lambda: False)
-    monkeypatch.setattr(dl, "_working", 0)
+    monkeypatch.setattr(dl, "routes", lambda progress=None: [("напрямую", None)])
+    monkeypatch.setattr(dl, "_working", (None, 0))
+    monkeypatch.setattr(dl, "_blocked_until", 0.0)
     FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: False)
     try:
         dl.extract("u", {}, False)
         assert False
     except dl.DownloadError as e:
-        assert "WARP не работает" in str(e) and "YT_COOKIES" in str(e)
-    assert len(FakeYDL.calls) == 3           # без WARP — только прямые способы
+        assert "YT_COOKIES" in str(e) and "PROXY_URL" in str(e)
+    assert len(FakeYDL.calls) == 3 and dl.youtube_blocked()
+
+
+def test_tor_circuits_differ():
+    a, b = dl._tor_circuit(), dl._tor_circuit()
+    assert a != b and a.startswith("socks5h://") and a.endswith("@127.0.0.1:9050")
 
 
 def test_other_errors_not_retried(monkeypatch):
@@ -287,7 +298,7 @@ def test_other_errors_not_retried(monkeypatch):
             FakeYDL.calls.append(1)
             raise yt_dlp.utils.DownloadError("ERROR: Private video")
     monkeypatch.setattr(yt_dlp, "YoutubeDL", Boom)
-    monkeypatch.setattr(dl, "_working", 0)
+    monkeypatch.setattr(dl, "_working", (None, 0))
     FakeYDL.calls = []
     try:
         dl.extract("u", {}, False)
@@ -310,8 +321,8 @@ def test_sc_match():
 def test_blocked_youtube_goes_straight_to_soundcloud(monkeypatch, tmp_path):
     import yt_dlp
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
-    monkeypatch.setattr(dl, "warp_up", lambda: False)
-    monkeypatch.setattr(dl, "_working", 0)
+    monkeypatch.setattr(dl, "routes", lambda progress=None: [("напрямую", None)])
+    monkeypatch.setattr(dl, "_working", (None, 0))
     monkeypatch.setattr(dl, "_blocked_until", 0.0)
     FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: False)
     t = spotify.Track(id="1", title="Song", artists=["A"], duration=200)

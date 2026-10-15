@@ -8,8 +8,11 @@ download(url, opt, ...) → файл на диске, готовый к отпр
 
 import logging
 import os
+import random
 import shutil
+import string
 import subprocess
+import time
 from dataclasses import dataclass
 
 import yt_dlp
@@ -74,48 +77,75 @@ def _base_opts() -> dict:
 # ОБХОДЫ БЛОКИРОВКИ YOUTUBE
 # ═══════════════════════════════════════════════════════════════
 # YouTube не любит адреса дата-центров («Sign in to confirm you're not a bot»).
-# Без кук пробуем по очереди: другие клиенты YouTube (телевизор, мобильный сайт, VR-приложение)
-# и выход в интернет через Cloudflare WARP (start.sh поднимает его как SOCKS-прокси).
-# Сработавший способ запоминаем и дальше начинаем с него.
+# Без кук пробуем по очереди: другие клиенты YouTube (телевизор, мобильный сайт, VR-приложение),
+# потом выход в интернет через прокси:
+#   PROXY_URL — свой прокси, если задан (http://логин:пароль@хост:порт или socks5://…)
+#   Tor       — start.sh поднимает его сам; каждая попытка идёт через новую выходную точку
+#   WARP      — Cloudflare WARP, включается WARP=on (нужен исходящий UDP, на Railway его нет)
+# Сработавший путь запоминаем и дальше начинаем с него.
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+TOR_PROXY = os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050")
 WARP_PROXY = os.getenv("WARP_PROXY", "socks5://127.0.0.1:40000")
+TOR_TRIES = int(os.getenv("TOR_TRIES", "4"))
 
-STRATEGIES = [
-    ("прямо", {}),
-    ("прямо, клиент ТВ", {"extractor_args": {"youtube": {"player_client": ["tv_simply", "tv"]}}}),
-    ("прямо, мобильный", {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}}),
-    ("WARP", {"proxy": "warp"}),
-    ("WARP, клиент ТВ", {"proxy": "warp", "extractor_args": {"youtube": {"player_client": ["tv_simply", "tv"]}}}),
-    ("WARP, мобильный", {"proxy": "warp", "extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}}),
+CLIENTS = [
+    ("", None),
+    ("клиент ТВ", ["tv_simply", "tv"]),
+    ("мобильный", ["mweb", "android_vr"]),
 ]
-_working = 0
+
+_proxy_state: dict[str, tuple[bool, float]] = {}
+_working: tuple[str | None, int] = (None, 0)      # (прокси или None, номер клиента)
+_blocked_until = 0.0                               # до этого времени YouTube считаем закрытым для сервера
 
 
-_warp_state = {"ok": None, "t": 0.0}
-_blocked_until = 0.0          # до этого времени YouTube считаем закрытым для сервера
-
-
-def warp_up() -> bool:
-    """WARP годится, только если через него реально открывается YouTube. Открытого порта мало:
-    туннель до Cloudflare может не подняться, и тогда каждый запрос висит до таймаута.
-    Результат помним 10 минут."""
-    import time
-    now = time.monotonic()
-    if _warp_state["ok"] is not None and now - _warp_state["t"] < 600:
-        return _warp_state["ok"]
+def proxy_ok(name: str, url: str) -> bool:
+    """Прокси годится, только если через него реально открывается YouTube.
+    Открытого порта мало: туннель может не подняться, и тогда каждый запрос висит до таймаута.
+    """
+    ok, t = _proxy_state.get(name, (None, 0.0))
+    # удачу помним 10 минут, неудачу — минуту: Tor после запуска поднимается не сразу
+    if ok is not None and time.monotonic() - t < (600 if ok else 60):
+        return ok
     ok = False
     try:
-        with yt_dlp.YoutubeDL({"proxy": WARP_PROXY, "socket_timeout": 8, "quiet": True}) as y:
+        with yt_dlp.YoutubeDL({"proxy": url, "socket_timeout": 15, "quiet": True}) as y:
             ok = y.urlopen("https://www.youtube.com/generate_204").status in (200, 204)
     except Exception as e:
-        logger.info("WARP не отвечает: %s", str(e)[:150])
-    _warp_state.update(ok=ok, t=now)
+        logger.info("%s не отвечает: %s", name, str(e)[:150])
+    _proxy_state[name] = (ok, time.monotonic())
     if ok:
-        logger.info("WARP работает")
+        logger.info("%s работает", name)
     return ok
 
 
+def warp_up() -> bool:
+    return proxy_ok("WARP", WARP_PROXY)
+
+
+def _tor_circuit() -> str:
+    """Tor кладёт запросы с разными логинами SOCKS в разные цепочки — так у каждой
+    попытки своя выходная точка и свой адрес для YouTube."""
+    tag = "".join(random.choices(string.ascii_lowercase, k=8))
+    return TOR_PROXY.replace("://", f"://{tag}:x@", 1)
+
+
+def routes(progress=None) -> list[tuple[str, str | None]]:
+    """Пути в интернет по порядку: напрямую, свой прокси, Tor (несколько цепочек), WARP."""
+    out: list[tuple[str, str | None]] = [("напрямую", None)]
+    if PROXY_URL and proxy_ok("свой прокси", PROXY_URL):
+        out.append(("свой прокси", PROXY_URL))
+    if os.getenv("TOR", "on") != "off":
+        if progress:
+            progress("проверяю Tor…")
+        if proxy_ok("Tor", _tor_circuit()):
+            out += [(f"Tor #{k + 1}", _tor_circuit()) for k in range(TOR_TRIES)]
+    if os.getenv("WARP", "off") == "on" and warp_up():
+        out.append(("WARP", WARP_PROXY))
+    return out
+
+
 def youtube_blocked() -> bool:
-    import time
     return time.monotonic() < _blocked_until
 
 
@@ -129,49 +159,60 @@ def is_blocked(err: Exception) -> bool:
 
 def extract(url: str, opts: dict, download: bool, progress=None) -> dict:
     """extract_info с перебором обходов. Не про блокировку — ошибка сразу наверх.
-    Каждый обход с короткими таймаутами, чтобы перебор занимал секунды, а не минуты."""
-    import time
+    Пока ищем рабочий путь, таймауты короткие, чтобы перебор занимал секунды, а не минуты."""
     global _working, _blocked_until
-    order = [_working] + [i for i in range(len(STRATEGIES)) if i != _working]
-    warp = None
+    attempts: list[tuple[str, str | None, int]] = []
+    # сначала то, что сработало в прошлый раз
+    sticky = _working != (None, 0)
+    if sticky:
+        attempts.append(("как в прошлый раз", _working[0], _working[1]))
+    direct = [("напрямую" + (f", {n}" if n else ""), None, i) for i, (n, _) in enumerate(CLIENTS)]
+    attempts += [a for a in direct if not (sticky and (a[1], a[2]) == _working)]
+
+    tried_proxies = False
     last = None
-    for n, i in enumerate(order):
-        name, extra = STRATEGIES[i]
+    n = 0
+    while True:
+        if not attempts:
+            if tried_proxies:
+                break
+            tried_proxies = True
+            for name, purl in routes(progress)[1:]:
+                # через прокси хватает двух клиентов: обычного и ТВ
+                attempts += [(name + (f", {CLIENTS[i][0]}" if i else ""), purl, i) for i in (0, 1)]
+            if not attempts:
+                break
+        name, purl, ci = attempts.pop(0)
         o = dict(opts)
-        if extra.get("proxy") == "warp":
-            if warp is None:
-                if progress:
-                    progress("проверяю обход через WARP…")
-                warp = warp_up()
-            if not warp:
-                continue
-            o["proxy"] = WARP_PROXY
-        if "extractor_args" in extra:
-            o["extractor_args"] = extra["extractor_args"]
+        if purl:
+            o["proxy"] = purl
+        if CLIENTS[ci][1]:
+            o["extractor_args"] = {"youtube": {"player_client": CLIENTS[ci][1]}}
         if not download or n > 0:
-            # пока ищем рабочий способ — не ждём долго; само скачивание идёт с обычными таймаутами
-            o |= {"socket_timeout": 12, "retries": 1, "extractor_retries": 1}
+            o |= {"socket_timeout": 20 if purl else 12, "retries": 1, "extractor_retries": 1}
         if n > 0 and progress:
-            progress(f"YouTube не пускает, пробую обход: {name}…")
+            progress(f"YouTube не пускает, пробую: {name}…")
+        n += 1
         try:
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=download)
                 info = ydl.sanitize_info(info) if info else info
-            if i != _working:
-                logger.info("YouTube пустил способом «%s»", name)
-                _working = i
+            if (purl, ci) != _working:
+                logger.info("YouTube пустил: %s", name)
+                _working = (purl, ci)
             _blocked_until = 0.0
             return info
         except yt_dlp.utils.DownloadError as e:
             last = e
             if not is_blocked(e):
                 raise DownloadError(explain(e)) from e
-            logger.warning("Способ «%s» не прошёл: %s", name, str(e).splitlines()[0][:200])
+            logger.warning("«%s» не прошло: %s", name, str(e).splitlines()[0][:200])
     msg = explain(last) if last else "Не получилось."
     if last and ("sign in" in str(last).lower() or "not a bot" in str(last).lower()):
         _blocked_until = time.monotonic() + 20 * 60
-        msg = ("YouTube не пускает сервер ни одним из обходов"
-               + ("" if warp else " (WARP не работает)") + ". Поможет только YT_COOKIES — см. README.")
+        _working = (None, 0)
+        msg = ("YouTube не пускает сервер ни напрямую, ни через Tor. "
+               "Поможет YT_COOKIES или свой прокси в PROXY_URL — см. README.")
     raise DownloadError(msg)
 
 

@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ffmpeg — склейка видео со звуком, mp3, превью; curl — скачать WARP-утилиты ниже
+# ffmpeg — склейка видео со звуком, mp3, превью; tor — обход блокировки YouTube; curl — для WARP ниже
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl tor && \
     rm -rf /var/lib/apt/lists/*
 
 # deno — yt-dlp решает им JS-проверки YouTube, без него часть роликов не качается
