@@ -104,7 +104,7 @@ def parse_embed(page: str, kind: str, sid: str) -> Collection:
     if not entity:
         if kind == "track":
             return _parse_html_track(page, sid)
-        raise dl.DownloadError("Spotify поменял страницу плеера — не нашёл список треков.")
+        return _parse_html_list(page, kind, sid)
 
     cover = _cover(entity)
     title = entity.get("name") or entity.get("title") or "Без названия"
@@ -127,6 +127,11 @@ def parse_embed(page: str, kind: str, sid: str) -> Collection:
                             album=title if kind == "album" else None,
                             cover=cover if kind == "album" else None, number=i))
     owner = entity.get("subtitle") or None
+    if not tracks:
+        # JSON есть, а треков в нём нет — берём список с самой страницы
+        coll = _parse_html_list(page, kind, sid)
+        coll.title, coll.cover, coll.owner = title, coll.cover or cover, owner
+        return coll
     return Collection(kind=kind, id=sid, title=title, tracks=tracks, cover=cover, owner=owner)
 
 
@@ -152,6 +157,51 @@ def _parse_html_track(page: str, sid: str) -> Collection:
         raise dl.DownloadError("Spotify поменял страницу плеера — не нашёл название трека.")
     t = Track(id=sid, title=title, artists=artists or ["?"], cover=cover)
     return Collection(kind="track", id=sid, title=title, tracks=[t], cover=cover)
+
+
+def _text(fragment: str) -> str:
+    import html as _html
+    return _html.unescape(re.sub(r"<[^>]+>", "", fragment)).replace("\u00a0", " ").strip()
+
+
+def _parse_html_list(page: str, kind: str, sid: str) -> Collection:
+    """Запасной разбор альбома/плейлиста по видимому списку: в каждом пункте название (h3),
+    исполнители (h4) и длительность «04:11». id трека может не быть — тогда делаем свой из названия."""
+    import hashlib
+    tracks = []
+    for n, block in enumerate(re.split(r"<li[\s>]", page)[1:], 1):
+        block = block.split("</li>", 1)[0]
+        h3 = re.search(r"<h3[^>]*>(.*?)</h3>", block, re.S)
+        if not h3:
+            continue
+        title = _text(h3.group(1))
+        h4 = re.search(r"<h4[^>]*>(.*?)</h4>", block, re.S)
+        artists = [a.strip() for a in _text(h4.group(1)).split(",") if a.strip()] if h4 else []
+        dur = None
+        dm = re.search(r">\s*(?:(\d+):)?(\d{1,2}):(\d{2})\s*<", block)
+        if dm:
+            hh, mm, ss = dm.groups()
+            dur = int(hh or 0) * 3600 + int(mm) * 60 + int(ss)
+        idm = re.search(r"(?:spotify:track:|/track/)([A-Za-z0-9]{22})", block)
+        tid = idm.group(1) if idm else "h" + hashlib.sha1(f"{artists}|{title}".encode()).hexdigest()[:21]
+        if title:
+            tracks.append(Track(id=tid, title=title, artists=artists or ["?"], duration=dur, number=n))
+
+    head = None
+    for pat in (r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', r"<h1[^>]*>(.*?)</h1>", r"<title>([^<|]+)"):
+        mm = re.search(pat, page, re.S)
+        if mm:
+            head = _text(mm.group(1))
+            break
+    cm = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', page) or \
+        re.search(r'(https://(?:i\.scdn\.co|image-cdn-[a-z]+\.spotifycdn\.com)/image/[A-Za-z0-9]+)', page)
+    cover = cm.group(1) if cm else None
+    if not tracks:
+        raise dl.DownloadError("Spotify поменял страницу плеера — не нашёл список треков.")
+    if kind == "album":
+        for t in tracks:
+            t.album, t.cover = head, cover
+    return Collection(kind=kind, id=sid, title=head or "Spotify", tracks=tracks, cover=cover)
 
 
 def _find_entity(node):

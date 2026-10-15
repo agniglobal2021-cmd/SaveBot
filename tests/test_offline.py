@@ -207,3 +207,19 @@ def test_find_url_real_message():
     m = Message(3, datetime.now(), chat, caption="https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
     assert "spotify" in bot.find_url(m)
     assert bot.find_url(Message(4, datetime.now(), chat, text="привет")) is None
+
+
+def test_spotify_album_html_fallback():
+    rows = "".join(
+        f'<li><div><span>{i}</span></div><div><h3 class="x"><span>{t}</span></h3>'
+        f'<h4>Carly Rae Jepsen</h4></div><div>{d}</div></li>'
+        for i, (t, d) in enumerate([("Run Away With Me", "04:11"), ("Emotion", "03:17"), ("I Didn&#x27;t Just", "1:02:03")], 1))
+    page = ('<html><h1>Emotion (Deluxe)</h1><img src="https://image-cdn-fa.spotifycdn.com/image/abc123">'
+            f'<ol>{rows}</ol></html>')
+    c = spotify.parse_embed(page, "album", "e" * 22)
+    assert c.title == "Emotion (Deluxe)" and len(c.tracks) == 3
+    t1, _, t3 = c.tracks
+    assert (t1.title, t1.artists, t1.duration, t1.album) == ("Run Away With Me", ["Carly Rae Jepsen"], 251, "Emotion (Deluxe)")
+    assert t3.title == "I Didn't Just" and t3.duration == 3723
+    assert t1.id != c.tracks[1].id and len(t1.id) == 22
+    assert t1.cover.startswith("https://image-cdn-fa")

@@ -429,7 +429,7 @@ async def run_playlist(context, menu: Message, sess: dict, opt: str):
             ok += 1
         except Exception as e:
             logger.warning("Плейлист: %s не вышел: %s", url, e)
-            failed.append(it.get("title") or url)
+            failed.append(f"{it.get('title') or url}: {e}")
         finally:
             shutil.rmtree(wd, ignore_errors=True)
     await finish_batch(status, sess.get("title"), ok, failed)
@@ -439,7 +439,7 @@ async def finish_batch(status: Status, title: str | None, ok: int, failed: list[
     status.prefix = ""
     text = f"Готово: <b>{h(title or '')}</b> — {ok} шт."
     if failed:
-        text += f"\nНе вышло ({len(failed)}):\n" + "\n".join(f"• {h(t)}" for t in failed[:20])
+        text += f"\nНе вышло ({len(failed)}):\n" + "\n".join(f"• {h(t)[:200]}" for t in failed[:15])
     await status.set(text)
 
 
@@ -483,7 +483,8 @@ async def handle_spotify(update: Update, context, url: str):
 
 
 async def run_spotify_track(context, status_msg: Message, track: spotify.Track, reply_to: int | None = None,
-                            status: Status | None = None) -> bool:
+                            status: Status | None = None) -> bool | str:
+    """True — отправлено, строка — почему не вышло."""
     bot, chat_id = context.bot, status_msg.chat_id
     key = f"spotify:{track.id}"
     own_status = status is None
@@ -510,12 +511,12 @@ async def run_spotify_track(context, status_msg: Message, track: spotify.Track, 
             await status.set(f"Не вышло: {h(e)}")
         else:
             logger.warning("Spotify %s: %s", track.id, e)
-        return False
+        return str(e)
     except Exception as e:
         logger.exception("Spotify-трек %s упал", track.id)
         if own_status:
             await status.set(f"Что-то сломалось: {h(e)}")
-        return False
+        return f"сбой: {e}"
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -526,10 +527,11 @@ async def run_spotify_collection(context, menu: Message, sess: dict):
     ok, failed = 0, []
     for i, t in enumerate(tracks, 1):
         status.prefix = f"{i}/{len(tracks)} · {h(t.artist)} — {h(t.title)}\n"
-        if await run_spotify_track(context, menu, t, status=status):
+        r = await run_spotify_track(context, menu, t, status=status)
+        if r is True:
             ok += 1
         else:
-            failed.append(f"{t.artist} — {t.title}")
+            failed.append(f"{t.artist} — {t.title}: {r}")
     await finish_batch(status, sess.get("title"), ok, failed)
 
 
