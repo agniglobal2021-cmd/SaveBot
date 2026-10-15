@@ -266,6 +266,7 @@ def test_strategies_fall_through_to_warp(monkeypatch):
 
 def test_strategies_no_warp_and_blocked(monkeypatch):
     import yt_dlp
+    monkeypatch.setattr(dl, "_blocked_until", 0.0)
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
     monkeypatch.setattr(dl, "warp_up", lambda: False)
     monkeypatch.setattr(dl, "_working", 0)
@@ -274,7 +275,7 @@ def test_strategies_no_warp_and_blocked(monkeypatch):
         dl.extract("u", {}, False)
         assert False
     except dl.DownloadError as e:
-        assert "WARP не поднялся" in str(e) and "YT_COOKIES" in str(e)
+        assert "WARP не работает" in str(e) and "YT_COOKIES" in str(e)
     assert len(FakeYDL.calls) == 3           # без WARP — только прямые способы
 
 
@@ -304,3 +305,23 @@ def test_sc_match():
     remix = {"title": "Fahr zur Hölle (Remix)", "uploader": "dj", "duration": 605}
     assert spotify.sc_match(preview, t) is None and spotify.sc_match(other, t) is None
     assert spotify.sc_match(good, t) < spotify.sc_match(fan, t) < spotify.sc_match(remix, t)
+
+
+def test_blocked_youtube_goes_straight_to_soundcloud(monkeypatch, tmp_path):
+    import yt_dlp
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(dl, "warp_up", lambda: False)
+    monkeypatch.setattr(dl, "_working", 0)
+    monkeypatch.setattr(dl, "_blocked_until", 0.0)
+    FakeYDL.calls, FakeYDL.rule = [], staticmethod(lambda o: False)
+    t = spotify.Track(id="1", title="Song", artists=["A"], duration=200)
+    sc = []
+    monkeypatch.setattr(spotify, "from_soundcloud", lambda tr, wd, pr: sc.append(tr) or None)
+    for _ in range(3):
+        try:
+            spotify.download_track(t, str(tmp_path))
+        except dl.DownloadError as e:
+            assert "SoundCloud" in str(e)
+    # YouTube пробовали только в первый раз (3 прямых способа, один поиск), дальше — сразу SoundCloud
+    assert len(FakeYDL.calls) == 3 and len(sc) == 3
+    assert dl.youtube_blocked()

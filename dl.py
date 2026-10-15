@@ -90,41 +90,69 @@ STRATEGIES = [
 _working = 0
 
 
+_warp_state = {"ok": None, "t": 0.0}
+_blocked_until = 0.0          # до этого времени YouTube считаем закрытым для сервера
+
+
 def warp_up() -> bool:
-    import socket
-    from urllib.parse import urlparse
-    u = urlparse(WARP_PROXY)
+    """WARP годится, только если через него реально открывается YouTube. Открытого порта мало:
+    туннель до Cloudflare может не подняться, и тогда каждый запрос висит до таймаута.
+    Результат помним 10 минут."""
+    import time
+    now = time.monotonic()
+    if _warp_state["ok"] is not None and now - _warp_state["t"] < 600:
+        return _warp_state["ok"]
+    ok = False
     try:
-        with socket.create_connection((u.hostname, u.port or 1080), timeout=1):
-            return True
-    except OSError:
-        return False
+        with yt_dlp.YoutubeDL({"proxy": WARP_PROXY, "socket_timeout": 8, "quiet": True}) as y:
+            ok = y.urlopen("https://www.youtube.com/generate_204").status in (200, 204)
+    except Exception as e:
+        logger.info("WARP не отвечает: %s", str(e)[:150])
+    _warp_state.update(ok=ok, t=now)
+    if ok:
+        logger.info("WARP работает")
+    return ok
+
+
+def youtube_blocked() -> bool:
+    import time
+    return time.monotonic() < _blocked_until
 
 
 def is_blocked(err: Exception) -> bool:
     low = str(err).lower()
     return any(k in low for k in ("sign in to confirm", "not a bot", "http error 403", "http error 429",
                                   "this content isn't available", "requested format is not available",
-                                  "failed to extract any player response", "unable to download api page"))
+                                  "failed to extract any player response", "unable to download api page",
+                                  "timed out", "proxy", "socks", "connection reset", "remote end closed"))
 
 
-def extract(url: str, opts: dict, download: bool) -> dict:
-    """extract_info с перебором обходов. Не про блокировку — ошибка сразу наверх."""
-    global _working
+def extract(url: str, opts: dict, download: bool, progress=None) -> dict:
+    """extract_info с перебором обходов. Не про блокировку — ошибка сразу наверх.
+    Каждый обход с короткими таймаутами, чтобы перебор занимал секунды, а не минуты."""
+    import time
+    global _working, _blocked_until
     order = [_working] + [i for i in range(len(STRATEGIES)) if i != _working]
     warp = None
     last = None
-    for i in order:
+    for n, i in enumerate(order):
         name, extra = STRATEGIES[i]
         o = dict(opts)
         if extra.get("proxy") == "warp":
             if warp is None:
+                if progress:
+                    progress("проверяю обход через WARP…")
                 warp = warp_up()
             if not warp:
                 continue
             o["proxy"] = WARP_PROXY
         if "extractor_args" in extra:
             o["extractor_args"] = extra["extractor_args"]
+        if not download or n > 0:
+            # пока ищем рабочий способ — не ждём долго; само скачивание идёт с обычными таймаутами
+            o |= {"socket_timeout": 12, "retries": 1, "extractor_retries": 1}
+        if n > 0 and progress:
+            progress(f"YouTube не пускает, пробую обход: {name}…")
         try:
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=download)
@@ -132,6 +160,7 @@ def extract(url: str, opts: dict, download: bool) -> dict:
             if i != _working:
                 logger.info("YouTube пустил способом «%s»", name)
                 _working = i
+            _blocked_until = 0.0
             return info
         except yt_dlp.utils.DownloadError as e:
             last = e
@@ -140,8 +169,9 @@ def extract(url: str, opts: dict, download: bool) -> dict:
             logger.warning("Способ «%s» не прошёл: %s", name, str(e).splitlines()[0][:200])
     msg = explain(last) if last else "Не получилось."
     if last and ("sign in" in str(last).lower() or "not a bot" in str(last).lower()):
+        _blocked_until = time.monotonic() + 20 * 60
         msg = ("YouTube не пускает сервер ни одним из обходов"
-               + ("" if warp else " (WARP не поднялся)") + ". Поможет только YT_COOKIES — см. README.")
+               + ("" if warp else " (WARP не работает)") + ". Поможет только YT_COOKIES — см. README.")
     raise DownloadError(msg)
 
 
@@ -341,7 +371,7 @@ def download(url: str, opt: str, workdir: str, progress=None, vertical: bool = F
         opts["progress_hooks"] = [_progress_hook(progress)]
         opts["postprocessor_hooks"] = [_pp_hook(progress)]
 
-    info = extract(url, opts, download=True)
+    info = extract(url, opts, download=True, progress=progress)
     if not info:
         raise DownloadError("По ссылке ничего не нашлось.")
 

@@ -499,7 +499,7 @@ async def run_spotify_track(context, status_msg: Message, track: spotify.Track, 
     wd = workdir()
     try:
         async with _slots:
-            await status.set("ищу на YouTube Music…")
+            await status.set("начинаю…")
             res = await asyncio.to_thread(spotify.download_track, track, wd, status)
             await status.set("отправляю…")
             await send_result(bot, chat_id, res, "audio", key, reply_to=reply_to)

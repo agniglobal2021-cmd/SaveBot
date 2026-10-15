@@ -259,7 +259,7 @@ def _seconds(ms) -> int | None:
 # ═══════════════════════════════════════════════════════════════
 # ПОИСК НА YOUTUBE MUSIC
 # ═══════════════════════════════════════════════════════════════
-def find_on_youtube(track: Track) -> str:
+def find_on_youtube(track: Track, progress=None) -> str:
     """Ссылка на этот трек на YouTube. Сначала раздел «Песни» YouTube Music (там официальные
     аудио без клипов и вставок), потом обычный поиск YouTube. Выбираем по длительности."""
     candidates: list[dict] = []
@@ -268,10 +268,12 @@ def find_on_youtube(track: Track) -> str:
                 f"ytsearch6:{track.query} audio"):
         try:
             opts = dl._base_opts() | {"extract_flat": True, "skip_download": True, "playlistend": 6}
-            res = dl.extract(url, opts, download=False) or {}
+            res = dl.extract(url, opts, download=False, progress=progress) or {}
             candidates = [e for e in (res.get("entries") or []) if e and e.get("id")]
         except dl.DownloadError as e:
             logger.warning("Поиск %s не удался: %s", url, e)
+            if dl.youtube_blocked():
+                raise                      # YouTube закрыт — второй поиск тоже не пройдёт
             candidates = []
         best = pick_candidate(candidates, track)
         if best:
@@ -314,7 +316,12 @@ def pick_candidate(entries: list[dict], track: Track) -> str | None:
 # ═══════════════════════════════════════════════════════════════
 def download_track(track: Track, workdir: str, progress=None) -> dl.Result:
     try:
-        yt_url = find_on_youtube(track)
+        if dl.youtube_blocked():
+            # YouTube только что не пустил ни одним способом — не тратим время, сразу на SoundCloud
+            raise dl.DownloadError("YouTube сейчас не пускает сервер.")
+        if progress:
+            progress("ищу на YouTube Music…")
+        yt_url = find_on_youtube(track, progress)
         logger.info("Spotify %s → %s", track.id, yt_url)
         res = dl.download(yt_url, "mp3", workdir, progress=progress)
     except dl.DownloadError as yt_err:
