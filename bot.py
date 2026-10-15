@@ -238,7 +238,8 @@ HELP = (
     "Кидай ссылку — пришлю файл.\n\n"
     "• <b>YouTube</b> и почти любой сайт с видео: TikTok, Instagram, X, VK, SoundCloud — выберешь качество или аудио\n"
     "• <b>Spotify</b>: трек придёт mp3 с обложкой и тегами, альбом или плейлист — целиком\n"
-    "• <b>Плейлист YouTube</b> — MP3 всех треков\n\n"
+    "• <b>Плейлист YouTube</b> — MP3 всех треков\n"
+    "• <b>cookies.txt</b> от YouTube — пришли файлом, если YouTube не пускает\n\n"
     "Лимит файла: {limit}. Без рекламы и подписок."
 )
 
@@ -260,12 +261,44 @@ async def deny(update: Update):
 
 
 # ═══════════════════════════════════════════════════════════════
+# КУКИ YOUTUBE: файлом или текстом прямо в чат
+# ═══════════════════════════════════════════════════════════════
+async def handle_cookies_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return await deny(update)
+    msg = update.effective_message
+    doc = msg.document
+    if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+        await msg.reply_text("Файл великоват для cookies.txt.")
+        return
+    data = await (await doc.get_file()).download_as_bytearray()
+    await take_cookies(msg, bytes(data).decode("utf-8", "replace"))
+
+
+async def take_cookies(msg: Message, text: str):
+    try:
+        n = dl.save_cookies(text, DATA_DIR)
+    except ValueError as e:
+        await msg.reply_text(f"Куки не подошли: {e}")
+        return
+    # в чате кукам не место: по ним можно войти в аккаунт
+    try:
+        await msg.delete()
+        gone = " Сообщение с ними я удалил из чата."
+    except TelegramError:
+        gone = " Удали сообщение с ними из чата — по ним можно войти в аккаунт."
+    await msg.chat.send_message(f"Куки YouTube приняты ({n} шт.), пробуй ссылку.{gone}")
+
+
+# ═══════════════════════════════════════════════════════════════
 # ССЫЛКА ПРИШЛА
 # ═══════════════════════════════════════════════════════════════
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return await deny(update)
     msg = update.effective_message
+    if msg.text and dl.looks_like_cookies(msg.text):
+        return await take_cookies(msg, msg.text)
     url = find_url(msg)
     if not url:
         await msg.reply_text("Пришли ссылку на видео или трек.")
@@ -591,6 +624,7 @@ def build_application() -> Application:
     app = b.build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_cookies_file))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
     app.add_error_handler(on_error)
     return app

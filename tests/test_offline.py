@@ -336,3 +336,25 @@ def test_blocked_youtube_goes_straight_to_soundcloud(monkeypatch, tmp_path):
     # YouTube пробовали только в первый раз (3 прямых способа, один поиск), дальше — сразу SoundCloud
     assert len(FakeYDL.calls) == 3 and len(sc) == 3
     assert dl.youtube_blocked()
+
+
+def test_save_cookies(tmp_path, monkeypatch):
+    monkeypatch.setattr(dl, "_blocked_until", 10**12)
+    good = ("# Netscape HTTP Cookie File\n# comment\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tabc\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tPREF\tf6=40000000\n")
+    assert dl.save_cookies(good, str(tmp_path)) == 2
+    assert dl.COOKIES_FILE == str(tmp_path / "cookies.txt") and not dl.youtube_blocked()
+    assert dl.looks_like_cookies(good)
+    no_login = ".youtube.com\tTRUE\t/\tTRUE\t0\tPREF\tx\n" * 3
+    for bad in ("hello", no_login, ".example.com\tTRUE\t/\tTRUE\t0\tSID\tx\n"):
+        try:
+            dl.save_cookies(bad, str(tmp_path))
+            assert False
+        except ValueError:
+            pass
+    # без заголовка тоже принимаем, заголовок добавим
+    dl.save_cookies(good.split("\n", 2)[2], str(tmp_path))
+    assert open(dl.COOKIES_FILE).read().startswith("# Netscape")
+    dl.COOKIES_FILE = None
+    assert not dl.looks_like_cookies("https://youtu.be/x")

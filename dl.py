@@ -54,6 +54,35 @@ def init_cookies(data_dir: str) -> None:
         logger.info("Куки для yt-dlp: %s", path)
 
 
+def save_cookies(text: str, data_dir: str) -> int:
+    """Куки, присланные боту файлом или текстом. Проверяем, что это cookies.txt с куками YouTube,
+    кладём на том и сразу пускаем в ход. Возвращает, сколько кук YouTube/Google в файле."""
+    global COOKIES_FILE, _working, _blocked_until
+    text = text.replace("\r\n", "\n").lstrip("\ufeff")
+    rows = [ln.split("\t") for ln in text.splitlines() if ln.strip() and not ln.startswith("# ")
+            and not ln.startswith("#\t") and ln.count("\t") >= 6]
+    yt = [r for r in rows if any(d in r[0] for d in ("youtube.com", "google.com"))]
+    if not yt:
+        raise ValueError("Это не похоже на cookies.txt с куками YouTube.")
+    if not any(r[5] in ("SID", "__Secure-3PSID", "LOGIN_INFO", "SAPISID") for r in yt):
+        raise ValueError("Куки YouTube есть, но без входа в аккаунт. Зайди на youtube.com под аккаунтом и сохрани ещё раз.")
+    if not text.startswith("# Netscape") and not text.startswith("# HTTP"):
+        text = "# Netscape HTTP Cookie File\n" + text
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, "cookies.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+    COOKIES_FILE = path
+    _working, _blocked_until = (None, 0), 0.0      # с куками начинаем перебор заново, напрямую
+    logger.info("Новые куки YouTube: %s шт.", len(yt))
+    return len(yt)
+
+
+def looks_like_cookies(text: str) -> bool:
+    return text.lstrip("\ufeff").startswith("# Netscape HTTP Cookie File") or (
+        text.count("\t") >= 12 and ".youtube.com" in text)
+
+
 def _base_opts() -> dict:
     opts = {
         "quiet": True,
