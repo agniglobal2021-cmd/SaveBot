@@ -546,7 +546,34 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def switch_off_cloud() -> None:
+    """Свой сервер Bot API работает, только если бот отвязан от облачного (logOut).
+    Делаем это сами один раз — метка на томе, чтобы не дёргать облако на каждом запуске.
+    Без LOCAL_BOT_API_URL метку стираем: облако примет бота обратно само минут через 10."""
+    import httpx
+    mark = os.path.join(DATA_DIR, ".cloud_logged_out")
+    if not LOCAL_BOT_API_URL:
+        if os.path.exists(mark):
+            os.remove(mark)
+        return
+    if os.path.exists(mark):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/logOut")
+        data = r.json()
+        # ok — отвязали сейчас; 401 — уже отвязан раньше
+        if data.get("ok") or r.status_code == 401:
+            open(mark, "w").close()
+            logger.info("Бот отвязан от облачного Bot API, работаю через %s", LOCAL_BOT_API_URL)
+        else:
+            logger.warning("logOut в облаке не прошёл: %s", data)
+    except Exception as e:
+        logger.warning("logOut в облаке не прошёл: %s", e)
+
+
 async def post_init(app: Application):
+    await switch_off_cloud()
     await app.bot.set_my_commands([BotCommand("start", "Что я умею")])
 
 
